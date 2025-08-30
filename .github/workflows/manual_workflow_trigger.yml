@@ -1,6 +1,11 @@
 name: Manual workflow
 on:
   workflow_dispatch:
+    inputs:
+      name: 
+        description: 'this is test variable'
+        type: string
+        default: 'test'
     
 jobs:
   demo: 
