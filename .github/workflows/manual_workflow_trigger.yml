@@ -1,4 +1,4 @@
-name: Demo Github Actions workflows
+name: Manual workflow
 on:
   workflow_dispatch:
     
