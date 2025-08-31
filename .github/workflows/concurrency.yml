@@ -21,6 +21,6 @@ jobs:
       - name: Use it later
         run: |
          echo "Build number is $BUILD_NUMBER"
-         sleep 120
+         sleep 10
         
         
