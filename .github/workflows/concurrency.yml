@@ -1,0 +1,22 @@
+on:
+  workflow_dispatch:
+    inputs:
+      build_number:
+        description: "Build number"
+        required: true
+        default: "1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+     
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Export input as environment variable
+        run: echo "BUILD_NUMBER=${{ github.event.inputs.build_number }}" >> $GITHUB_ENV
+
+      - name: Use it later
+        run: echo "Build number is $BUILD_NUMBER"
