@@ -1,0 +1,23 @@
+name: Steps output
+
+on:
+  push:
+    branches:
+      - develop
+
+jobs:      
+  steps-output:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Set output
+        id: set-op
+        shell: bash
+        run: echo "age=33" >> $GITHUB_OUTPUT
+
+      - name: access output variable
+        run: echo $ {{ steps.set-op.outputs.age }}
+        
+        
+  
+    
