@@ -3,17 +3,16 @@ name: Manual Workflow with Number Input
 on:
   workflow_dispatch:
     inputs:
-      myNumberInput:
-        description: 'Enter a number for processing'
+      deployment_version:
+        description: 'Specify the deployment version number'
         required: true
         type: number
-        default: 100 # Optional: A default value for the input
+        default: "1.0"
 
 jobs:
-  process_number:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Use the number input
+      - name: Use Deployment Version
         run: |
-          echo "The number entered was: ${{ inputs.myNumberInput }}"
-          echo "Double the number: $(( inputs.myNumberInput * 2 ))"
+          echo "Deploying version: ${{ github.event.inputs.deployment_version }}"
