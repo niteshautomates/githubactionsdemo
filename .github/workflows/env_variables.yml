@@ -1,0 +1,26 @@
+name: Env Vars Example
+
+on:
+  workflow_dispatch:
+
+env:   # Global env vars (available to all jobs & steps)
+  APP_ENV: production
+  DB_USER: admin
+  DB_PASS: secret123
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show environment variables
+        run: |
+          echo "App Env: $APP_ENV"
+          echo "DB User: $DB_USER"
+
+  deploy:
+    runs-on: ubuntu-latest
+    env:   # Job scope only
+      REGION: us-east-1
+    steps:
+      - name: Print region
+        run: echo "Deploying to $REGION"
