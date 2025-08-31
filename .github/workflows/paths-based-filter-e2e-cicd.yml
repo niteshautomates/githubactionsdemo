@@ -1,0 +1,274 @@
+# .github/workflows/ci-monorepo.yaml
+name: Monorepo CI/CD (Build, Security, Sonar, Nexus, ECR, ArgoCD)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'service-*/**'
+      - 'pom.xml'
+      - 'k8s/**'
+      - '.github/workflows/**'
+  pull_request:
+    paths:
+      - 'service-*/**'
+      - 'pom.xml'
+      - 'k8s/**'
+      - '.github/workflows/**'
+
+permissions:
+  contents: write         # commit manifest updates
+  packages: read
+  id-token: write         # AWS OIDC
+  actions: read
+  pull-requests: write
+
+env:
+  JAVA_VERSION: '17'
+  SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+  SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY_ALIAS: ${{ secrets.ECR_REGISTRY_ALIAS }} # optional (e.g., aws-account-id.dkr.ecr.<region>.amazonaws.com)
+  ECR_REPO_PREFIX: ${{ secrets.ECR_REPO_PREFIX }}        # e.g., monorepo
+  NEXUS_SERVER_ID: nexus-prod
+  NEXUS_URL: ${{ secrets.NEXUS_URL }}                    # e.g., https://nexus.example.com
+  NEXUS_USERNAME: ${{ secrets.NEXUS_USERNAME }}
+  NEXUS_PASSWORD: ${{ secrets.NEXUS_PASSWORD }}
+  ARGOCD_SERVER: ${{ secrets.ARGOCD_SERVER }}            # e.g., argocd.example.com
+  ARGOCD_USERNAME: ${{ secrets.ARGOCD_USERNAME }}
+  ARGOCD_PASSWORD: ${{ secrets.ARGOCD_PASSWORD }}
+  # or use ARGOCD_TOKEN in place of username/password
+
+jobs:
+  # -------- Detect which services changed (to scope image builds/push/deploy) --------
+  detect-changes:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.filter.outputs.changes_json }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect changed folders
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          filters: |
+            services:
+              - added|modified: 'service-*/**'
+
+  # -------- Build ALL modules, run tests, FS security scan, Sonar, Nexus publish --------
+  build-test-security-sonar:
+    name: Build, Test, Trivy FS, Sonar & Nexus
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: maven
+          server-id: ${{ env.NEXUS_SERVER_ID }}                    # matches distributionManagement <id>
+          server-username: NEXUS_USERNAME
+          server-password: NEXUS_PASSWORD
+
+      - name: Cache Maven repo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+          key: m2-${{ runner.os }}-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            m2-${{ runner.os }}-
+
+      # -------- Full build & unit tests (all modules) --------
+      - name: Maven build & test (all modules)
+        run: mvn -B -U clean verify
+
+      # -------- Trivy Filesystem (SCA/IaC) scan --------
+      - name: Trivy FS scan (repo)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-fs.sarif'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy FS results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-fs.sarif
+
+      # -------- Sonar scan (aggregate) --------
+      # Option A: run once for the whole monorepo (single project in Sonar)
+      - name: Sonar Scan (aggregate)
+        run: |
+          mvn -B -DskipTests sonar:sonar \
+            -Dsonar.host.url="${{ env.SONAR_HOST_URL }}" \
+            -Dsonar.login="${{ env.SONAR_TOKEN }}"
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      - name: Sonar Quality Gate
+        uses: sonarsource/sonarqube-quality-gate-action@v1.1.0
+        with:
+          scanMetadataReportFile: target/sonar/report-task.txt
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+      # -------- Publish artifacts to Nexus --------
+      # Requires <distributionManagement> in root/child POMs with <id>${NEXUS_SERVER_ID}</id>
+      - name: Publish to Nexus (Maven deploy)
+        run: mvn -B -DskipTests deploy
+
+      - name: Upload surefire & coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-and-coverage
+          path: |
+            **/target/surefire-reports/**
+            target/site/jacoco-aggregate/**
+
+  # -------- Build Docker, Trivy Image Scan, Push to ECR, Update K8s Manifests, ArgoCD --------
+  docker-publish-deploy:
+    name: Docker Build, Trivy Image, ECR Push, Manifest Update, ArgoCD Deploy
+    runs-on: ubuntu-latest
+    needs: [detect-changes, build-test-security-sonar]
+    if: ${{ needs.detect-changes.outputs.services != '[]' && needs.detect-changes.outputs.services != '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract service name
+        id: svc
+        run: |
+          # matrix.service contains a changed path like service-user/some/file.java
+          ROOT_DIR="$(echo '${{ matrix.service }}' | cut -d/ -f1)"
+          echo "root_dir=$ROOT_DIR" >> $GITHUB_OUTPUT
+          IMAGE_NAME="${ROOT_DIR#service-}"   # e.g., user, hotel, ratings
+          echo "image_name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Set image/version vars
+        id: vars
+        run: |
+          SHORT_SHA="${GITHUB_SHA::12}"
+          DATE_TAG="$(date -u +%Y%m%d%H%M%S)"
+          VERSION="${DATE_TAG}-${SHORT_SHA}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          # ECR registry (either full from secret, or derive from AWS login step later)
+          echo "ecr_repo=${{ env.ECR_REPO_PREFIX }}/$(echo '${{ steps.svc.outputs.image_name }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+
+      # -------- AWS auth & ECR login (OIDC) --------
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Compute full image ref
+        id: imageref
+        run: |
+          REG="${{ steps.ecr.outputs.registry }}"
+          # If a fixed registry is supplied, prefer it
+          if [ -n "${{ env.ECR_REGISTRY_ALIAS }}" ]; then REG="${{ env.ECR_REGISTRY_ALIAS }}"; fi
+          FULL="${REG}/${{ steps.vars.outputs.ecr_repo }}:${{ steps.vars.outputs.version }}"
+          echo "full_image=$FULL" >> $GITHUB_OUTPUT
+
+      # -------- Build Docker image for this service --------
+      - name: Build image
+        working-directory: ${{ steps.svc.outputs.root_dir }}
+        run: |
+          docker build \
+            --build-arg MAVEN_REPO_URL="${{ env.NEXUS_URL }}" \
+            -t "${{ steps.imageref.outputs.full_image }}" \
+            -t "${{ steps.imageref.outputs.full_image%:* }}:latest" \
+            .
+
+      # -------- Trivy image scan --------
+      - name: Trivy Image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.imageref.outputs.full_image }}
+          format: 'sarif'
+          output: 'trivy-image-${{ steps.svc.outputs.image_name }}.sarif'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+
+      - name: Upload Trivy image SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-image-${{ steps.svc.outputs.image_name }}.sarif
+
+      # -------- Push to ECR --------
+      - name: Push image to ECR
+        run: |
+          docker push "${{ steps.imageref.outputs.full_image }}"
+          docker push "${{ steps.imageref.outputs.full_image%:* }}:latest"
+
+      # -------- Update K8s manifest with new tag --------
+      - name: Install yq
+        uses: mikefarah/yq@v4.44.3
+
+      - name: Update manifest image tag
+        run: |
+          MANIFEST="k8s/${{ steps.svc.outputs.root_dir }}/deployment.yaml"
+          if [ ! -f "$MANIFEST" ]; then
+            echo "Manifest $MANIFEST not found"; exit 1
+          fi
+          IMG="${{ steps.imageref.outputs.full_image }}"
+          # Assuming standard Deployment, first container image update:
+          yq -i '
+            (.spec.template.spec.containers[0].image) = "'"$IMG"'"
+          ' "$MANIFEST"
+
+      - name: Commit manifest change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add k8s/${{ steps.svc.outputs.root_dir }}/deployment.yaml
+          git commit -m "chore(${ { steps.svc.outputs.image_name } }): bump image to ${{ steps.imageref.outputs.full_image }}"
+          git push
+
+      # -------- Argo CD deploy (sync the app) --------
+      - name: Install ArgoCD CLI
+        run: |
+          curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+          chmod +x argocd
+          sudo mv argocd /usr/local/bin/argocd
+
+      - name: ArgoCD Login
+        if: ${{ env.ARGOCD_TOKEN == '' }}
+        run: |
+          argocd login "${{ env.ARGOCD_SERVER }}" \
+            --username "${{ env.ARGOCD_USERNAME }}" \
+            --password "${{ env.ARGOCD_PASSWORD }}" \
+            --insecure
+      - name: ArgoCD Login (token)
+        if: ${{ env.ARGOCD_TOKEN != '' }}
+        run: |
+          argocd login "${{ env.ARGOCD_SERVER }}" \
+            --auth-token "${{ env.ARGOCD_TOKEN }}" \
+            --insecure
+
+      - name: ArgoCD Sync app
+        run: |
+          # Assuming each service has a matching ArgoCD app name, e.g., app: service-user
+          APP="${{ steps.svc.outputs.root_dir }}"
+          argocd app sync "$APP" --prune --timeout 600
+          argocd app wait "$APP" --health --timeout 600
