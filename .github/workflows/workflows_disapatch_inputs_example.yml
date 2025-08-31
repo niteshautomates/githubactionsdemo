@@ -8,6 +8,13 @@ on:
         required: true
         type: number
         default: "1.0"
+      environment:
+        description: 'select environment'
+        type: choice
+        options:
+          - dev
+          - stage
+          - prod
 
 jobs:
   deploy:
@@ -16,3 +23,4 @@ jobs:
       - name: Use Deployment Version
         run: |
           echo "Deploying version: ${{ github.event.inputs.deployment_version }}"
+          echo "Deploying on Environment: ${{ github.event.inputs.environment }}"
